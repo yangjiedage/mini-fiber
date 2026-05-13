@@ -13,9 +13,32 @@ let wipFiber = null;
 let hookIndex = null;
 let currentRootFiber = null;
 
+function shallowCompare(next, prev) {
+    if (prev === next) return true;
+    if (typeof prev !== 'object' || typeof next !== 'object') return false;
+    const prevKeys = Object.keys(prev);
+    const nextKeys = Object.keys(next);
+    if (prevKeys.length !== nextKeys.length) return false;
+    for (let i = 0; i < prevKeys.length; i++) {
+        if (prevKeys[i] === 'children') continue;
+        if (prev[prevKeys[i]] !== next[prevKeys[i]]) return false;
+    }
+    return true;
+}
+
+export function fakeMemo(component) {
+    return (next, prev) => {
+        if (!prev) return component(next)
+        if (shallowCompare(next, prev)) return null;
+        return component(next);
+    };
+}
+
 export function createElement(type, props, ...children) {
+    const key = props && props.key ? props.key : null;
     return {
         type,
+        key,
         props: {
             ...props,
             children: children.flat().map(child =>
@@ -74,7 +97,6 @@ function scheduleUpdate(fiber) {
 function workLoop(didTimeout, taskRoot) {
     const currentLane = getCurrentPriorityLevel();
 
-    console.log('work loop', currentLane, workInProgress)
     // Preemption check: if current task is higher priority than ongoing work
     if (!workInProgress || (workInProgress.lane && currentLane < workInProgress.lane)) {
         workInProgress = taskRoot;
@@ -144,7 +166,40 @@ function updateFunctionComponent(fiber, root) {
     wipFiber = fiber;
     hookIndex = 0;
     wipFiber.hooks = [];
-    const result = fiber.type(fiber.props);
+    const result = fiber.type(fiber.props, fiber.alternate?.props);
+
+    // Bailout for memo: if result is exactly null (returned by fakeMemo)
+    // and we have an alternate, we just clone the old children instead of re-rendering.
+    if (result === null && fiber.alternate) {
+        let child = fiber.alternate.child;
+        let prevSibling = null;
+        while (child) {
+            const newFiber = {
+                type: child.type,
+                key: child.key,
+                props: child.props,
+                stateNode: child.stateNode,
+                return: fiber, // point to current fiber (the bailed out one)
+                alternate: child,
+                effectTag: Update,
+                index: child.index,
+            };
+            if (!prevSibling) {
+                fiber.child = newFiber;
+            } else {
+                prevSibling.sibling = newFiber;
+            }
+            prevSibling = newFiber;
+
+            // To ensure the entire sub-tree is kept, we also need to copy
+            // refs to the children of this duplicated fiber, but for simplicity
+            // in a naive reconciler, we let the work loop descend into them 
+            // and they will be reconciled against their alternates without changes.
+            child = child.sibling;
+        }
+        return;
+    }
+
     const elements = Array.isArray(result) ? result : [result];
     reconcileChildren(fiber, elements.flat(), root);
 }
@@ -163,52 +218,149 @@ function reconcileChildren(wipFiber, elements, root) {
     let index = 0;
     let oldFiber = wipFiber.alternate && wipFiber.alternate.child;
     let prevSibling = null;
+    let lastPlacedIndex = 0;
 
-    while (index < elements.length || oldFiber != null) {
+    // 1. First Pass: Sequential matching (Same key and type)
+    // This handles the common case where items are just appended or updated in order.
+    while (oldFiber && index < elements.length) {
         const element = elements[index];
-        let newFiber = null;
-
         const isFalsy = element === null || element === false || element === undefined;
-        const sameType = oldFiber && !isFalsy && element.type === oldFiber.type;
 
-        if (sameType) {
-            newFiber = {
-                type: oldFiber.type,
-                props: element.props,
-                stateNode: oldFiber.stateNode,
-                return: wipFiber,
-                alternate: oldFiber,
-                effectTag: Update,
-            };
-        } else if (!isFalsy && element) {
-            newFiber = {
-                type: element.type,
-                props: element.props,
-                stateNode: null,
-                return: wipFiber,
-                alternate: null,
-                effectTag: Placement,
-            };
+        if (isFalsy) {
+            index++;
+            continue;
         }
 
-        if (oldFiber && !sameType) {
-            oldFiber.effectTag = Deletion;
-            root.deletions.push(oldFiber);
+        if (oldFiber.key !== element.key || oldFiber.type !== element.type) {
+            break;
         }
 
-        if (oldFiber) oldFiber = oldFiber.sibling;
+        // Key and Type match, reuse!
+        const newFiber = {
+            type: oldFiber.type,
+            key: oldFiber.key,
+            props: element.props,
+            stateNode: oldFiber.stateNode,
+            return: wipFiber,
+            alternate: oldFiber,
+            effectTag: Update,
+            index: index,
+        };
 
         if (index === 0) {
             wipFiber.child = newFiber;
         } else if (prevSibling) {
             prevSibling.sibling = newFiber;
         }
+        prevSibling = newFiber;
 
-        if (newFiber) {
-            prevSibling = newFiber;
-        }
+        oldFiber = oldFiber.sibling;
         index++;
     }
+
+    // 2. If we finished all new elements, delete remaining old fibers
+    if (index === elements.length) {
+        while (oldFiber) {
+            oldFiber.effectTag = Deletion;
+            root.deletions.push(oldFiber);
+            oldFiber = oldFiber.sibling;
+        }
+        return;
+    }
+
+    // 3. If we ran out of old fibers, create new ones for remaining elements
+    if (!oldFiber) {
+        while (index < elements.length) {
+            const element = elements[index];
+            if (element != null && element !== false) {
+                const newFiber = {
+                    type: element.type,
+                    key: element.key || null,
+                    props: element.props,
+                    stateNode: null,
+                    return: wipFiber,
+                    alternate: null,
+                    effectTag: Placement,
+                    index: index,
+                };
+
+                if (index === 0) wipFiber.child = newFiber;
+                else if (prevSibling) prevSibling.sibling = newFiber;
+                prevSibling = newFiber;
+            }
+            index++;
+        }
+        return;
+    }
+
+    // 4. Map-based matching for reordering
+    // Create a map of remaining old fibers
+    const existingChildren = new Map();
+    let scanOld = oldFiber;
+    let oldIndex = index; // The current index in the old list
+    while (scanOld) {
+        const key = scanOld.key !== null ? scanOld.key : oldIndex;
+        existingChildren.set(key, scanOld);
+        scanOld = scanOld.sibling;
+        oldIndex++;
+    }
+
+    while (index < elements.length) {
+        const element = elements[index];
+        if (element == null || element === false) {
+            index++;
+            continue;
+        }
+
+        const key = element.key !== null && element.key !== undefined ? element.key : index;
+        const matchedOld = existingChildren.get(key);
+        let newFiber;
+
+        if (matchedOld && matchedOld.type === element.type) {
+            // Found a match! Reuse.
+            existingChildren.delete(key);
+            newFiber = {
+                type: matchedOld.type,
+                key: matchedOld.key,
+                props: element.props,
+                stateNode: matchedOld.stateNode,
+                return: wipFiber,
+                alternate: matchedOld,
+                effectTag: Update,
+                index: index,
+            };
+
+            // Movement detection: if the old position is to the left of where we've placed, it moved.
+            if (matchedOld.index < lastPlacedIndex) {
+                newFiber.effectTag = Placement | Update;
+            } else {
+                lastPlacedIndex = matchedOld.index;
+            }
+        } else {
+            // No match, create new.
+            newFiber = {
+                type: element.type,
+                key: element.key || null,
+                props: element.props,
+                stateNode: null,
+                return: wipFiber,
+                alternate: null,
+                effectTag: Placement,
+                index: index,
+            };
+        }
+
+        if (index === 0) wipFiber.child = newFiber;
+        else if (prevSibling) prevSibling.sibling = newFiber;
+        prevSibling = newFiber;
+        index++;
+    }
+
+    // 5. Delete anything left in the map
+    existingChildren.forEach(child => {
+        child.effectTag = Deletion;
+        root.deletions.push(child);
+    });
 }
 
 function commitRoot(root) {
@@ -253,25 +405,28 @@ const isNew = (p, n) => k => p[k] !== n[k];
 const isGone = (p, n) => k => !(k in n);
 
 function updateDom(dom, prev, next) {
-    Object.keys(prev).filter(isEvent).filter(k => !(k in next) || isNew(prev, next)(k)).forEach(n => {
-        dom.removeEventListener(n.toLowerCase().substring(2), prev[n]);
+    const prevProps = prev || {};
+    const nextProps = next || {};
+
+    Object.keys(prevProps).filter(isEvent).filter(k => !(k in nextProps) || isNew(prevProps, nextProps)(k)).forEach(n => {
+        dom.removeEventListener(n.toLowerCase().substring(2), prevProps[n]);
     });
-    Object.keys(prev).filter(isProperty).filter(isGone(prev, next)).forEach(n => {
-        if (n === 'style' && typeof prev[n] === 'object') {
-            Object.keys(prev[n]).forEach(s => dom.style[s] = '');
+    Object.keys(prevProps).filter(isProperty).filter(isGone(prevProps, nextProps)).forEach(n => {
+        if (n === 'style' && typeof prevProps[n] === 'object') {
+            Object.keys(prevProps[n]).forEach(s => dom.style[s] = '');
         } else {
             dom[n] = '';
         }
     });
-    Object.keys(next).filter(isProperty).filter(isNew(prev, next)).forEach(n => {
-        if (n === 'style' && typeof next[n] === 'object') {
-            Object.assign(dom.style, next[n]);
+    Object.keys(nextProps).filter(isProperty).filter(isNew(prevProps, nextProps)).forEach(n => {
+        if (n === 'style' && typeof nextProps[n] === 'object') {
+            Object.assign(dom.style, nextProps[n]);
         } else {
-            dom[n] = next[n];
+            dom[n] = nextProps[n];
         }
     });
-    Object.keys(next).filter(isEvent).filter(isNew(prev, next)).forEach(n => {
-        dom.addEventListener(n.toLowerCase().substring(2), next[n]);
+    Object.keys(nextProps).filter(isEvent).filter(isNew(prevProps, nextProps)).forEach(n => {
+        dom.addEventListener(n.toLowerCase().substring(2), nextProps[n]);
     });
 }
 

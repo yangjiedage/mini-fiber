@@ -3,12 +3,16 @@
 import * as MiniFiber from './reconciler.js';
 import { useState, useEffect, useRef, useLayoutEffect } from './hooks.js';
 import { scheduleCallback, UserBlockingPriority, LowPriority } from './scheduler.js';
+import LetterItem from './LetterItem.jsx';
+import './app.css'
+import styles from './app.module.css'
 
 function App() {
     const [count, setCount] = useState(1);
     const [showList, setShowList] = useState(false);
     const [letterList, setLetterList] = useState(['a', 'b', 'c', 'd']);
     const listRef = useRef(null);
+    const [letter, setLetter] = useState('aaaa');
 
     useEffect(() => {
         console.log('useEffect: count changed to', count);
@@ -67,14 +71,23 @@ function App() {
                 )}
             </div>
 
-            <div>
-                {letterList.map(item => <div key={{ item }}>{item}</div>)}
-            </div>
+            {/* <div>
+                {letterList.map(item => <LetterItem key={item} letter={item} />)}
+            </div> */}
+            <button onClick={() => {
+                setLetter(`${Math.random().toFixed(2)}`)
+            }} className="btn">
+                change letter
+            </button>
+            <LetterItem letter={letter} />
             <button onClick={() => {
                 setLetterList(['b', 'c', 'd', 'a'])
             }}>change letter list</button>
             <div style={{ fontSize: '0.9em', color: '#666' }}>
                 <p>Check the console to see the Work Loop and Hook logs.</p>
+            </div>
+            <div style={styles['text-tips']}>
+                hhhhhh
             </div>
         </div>
     );
