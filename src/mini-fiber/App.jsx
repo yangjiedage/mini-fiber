@@ -30,7 +30,7 @@ function App() {
         console.log('handleHeavyTask: Scheduling low priority update (+1)...');
         scheduleCallback(LowPriority, () => {
             setShowList(true);
-            setCount(c => c + 1);
+            setCount(c => c + 10);
         });
     };
 
